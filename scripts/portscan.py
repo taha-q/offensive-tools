@@ -1,216 +1,134 @@
-import asyncio
+"""
+A simple portscanner
+"""
+
 import argparse
-from typing import Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import socket
 
-"""
-Async Port Scanner
-------------------
-A simple asynchronous TCP port scanner that:
-- Scans a target host over a given port range
-- Attempts banner grabbing
-- Optionally sends a payload if no banner is received
-
-Last Update: 15/04/2026
-Author: TAH4 (refactored)
-"""
-
-# Global storage for open ports and their banners
-OPEN_PORTS: Dict[int, str] = {}
+# Global configuration
+COLORS = {
+    "red": "\033[31m",
+    "green": "\033[32m", 
+    "blue": "\033[34m",
+    "reset": "\033[0m",
+}
 
 
-# -----------------------------
-# Core Scanning Logic
-# -----------------------------
-async def scan_single_port(
-    host: str,
-    port: int,
-    buffer_size: int,
-    payload: str
-) -> None:
-    """
-    Attempt to connect to a single port and grab service/banner info.
+# Helper functions
+def perror(message: str) -> None:
+    """Prints the error message and exits with exit-code 1."""
+    print(message)
+    exit(1)
 
-    Args:
-        host (str): Target host (IP or domain)
-        port (int): Port number to scan
-        buffer_size (int): Max bytes to read from socket
-        payload (str): Payload sent if no banner is received
-    """
+
+# Logic
+def scan(ip: str, port: int, timeout: float, banner_size: int, payload: str) -> dict | None:
+    """Scans a port and returns a dict if open, or None if closed."""
     try:
-        reader, writer = await asyncio.open_connection(host, port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
 
-        print(f"[+] Open port found: {port}")
+            if sock.connect_ex((ip, port)) == 0:
+                try:
+                    banner = sock.recv(banner_size).decode(errors="replace")
+                except socket.timeout:
+                    banner = ""
 
-        # catch the port
-        OPEN_PORTS[port] = 'no banner received'
+                if not banner:
+                    try:
+                        sock.sendall(payload.encode())
+                        banner = sock.recv(banner_size).decode(errors="replace") or "open (no data)"
+                    except socket.error:
+                        banner = "open (no data)"
 
-        # Try to read banner
-        banner = (await reader.read(buffer_size)).decode(errors="ignore").strip()
+                return {"port": port, "banner": banner.strip()}
 
-        # If no banner, send payload
-        if not banner:
-            print(f"[>] Sending payload to port {port}: {payload!r}")
-            writer.write(payload.encode())
-            await writer.drain()
-
-            banner = (await reader.read(buffer_size)).decode(errors="ignore").strip()
-
-        OPEN_PORTS[port] = banner or "No banner received"
-
-        writer.close()
-        await writer.wait_closed()
-
-    except OSError:
-        # Closed port / unreachable
-        pass
+    except OSError as e:
+        print(f"{COLORS['red']}E:{COLORS['reset']} {e}")
+    
+    return None
 
 
-async def scan_with_limit(
-    host: str,
-    port: int,
-    timeout: float,
-    buffer_size: int,
-    payload: str,
-    semaphore: asyncio.Semaphore
-) -> None:
-    """
-    Wrap scanning with concurrency limit and timeout.
+def parse_port_range(port_range: str) -> dict[str, int]:
+    """Parses the given port-range string and returns start and end ports."""
+    _range = {"start": 1, "end": 1024}
+    
+    one_to_n_pattern = r"^-\d+$"
+    n_to_max_pattern = r"^\d+-$"
+    standard_range_pattern = r"^\d+-\d+$"
 
-    Args:
-        host (str): Target host
-        port (int): Port number
-        timeout (float): Timeout per scan
-        buffer_size (int): Read buffer size
-        payload (str): Payload to send
-        semaphore (asyncio.Semaphore): Concurrency limiter
-    """
-    async with semaphore:
-        try:
-            await asyncio.wait_for(
-                scan_single_port(host, port, buffer_size, payload),
-                timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            print(f"[-] Timeout on port {port}")
+    try:
+        if re.match(n_to_max_pattern, port_range):
+            _range["start"] = int(port_range.replace("-", ""))
+            _range["end"] = 65535
+        elif re.match(one_to_n_pattern, port_range):
+            _range["start"] = 1       
+            _range["end"] = int(port_range.replace("-", ""))
+        elif re.match(standard_range_pattern, port_range):
+            parts = port_range.split("-")
+            _range["start"] = int(parts[0])
+            _range["end"] = int(parts[1])
+        else:
+            raise ValueError("Format must be n-k, n-, or -n")
+
+        return _range
+ 
+    except ValueError as e:
+        perror(f"{COLORS['red']}E: invalid range [debug-error: {e}]{COLORS['reset']}")
 
 
-# -----------------------------
-# CLI Arguments
-# -----------------------------
-def parse_arguments():
-    """
-    Parse CLI arguments.
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="A simple portscanner")
 
-    Returns:
-        argparse.Namespace: Parsed arguments
-    """
-    parser = argparse.ArgumentParser(
-        description="Async TCP Port Scanner with Banner Grabbing"
+    port_help_msg = (
+        "specify the scan range:\n"
+        "case 1: n-k. scans from n to k\n"
+        "case 2: n-. scans from n to 65535\n"
+        "case 3: -n. scans from 1 to n"
     )
 
-    parser.add_argument("host", help="Target host (IP or domain)")
-    parser.add_argument(
-        "-r", "--range",
-        type=int,
-        default=1024,
-        help="Scan ports from 1 to N (default: 1024)"
-    )
-    parser.add_argument(
-        "--payload",
-        default="hello",
-        help="Payload sent if no banner is received"
-    )
-    parser.add_argument(
-        "-t", "--timeout",
-        type=float,
-        default=0.5,
-        help="Timeout per port (seconds)"
-    )
-    parser.add_argument(
-        "--buffer-size",
-        type=int,
-        default=4096,
-        help="Max bytes to read from socket"
-    )
-    parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=500,
-        help="Maximum concurrent connections"
-    )
+    parser.add_argument("host", type=str, nargs="?", default="127.0.0.1")
+    parser.add_argument("-p", "--port", type=str, default="1-1024", help=port_help_msg)
+    parser.add_argument("-t", "--timeout", type=float, default=1.0)
+    parser.add_argument("--threads", type=int, default=200, help="number of threads to use. default is 200")
+    parser.add_argument("--banner-size", type=int, default=4096, help="amount of data a banner holds. default is 4096 byte")
+    parser.add_argument("--payload", type=str, default="", help="specify a payload to send (optional)")
 
     return parser.parse_args()
 
 
-# -----------------------------
-# UI / Menu Display
-# -----------------------------
-def print_scan_summary(host: str, port_range: int):
-    """
-    Print scan summary in a clean menu format.
-    """
-    print("\n" + "=" * 50)
-    print("        ASYNC PORT SCANNER RESULTS")
-    print("=" * 50)
-    print(f"Target       : {host}")
-    print(f"Port Range   : 1 - {port_range}")
-    print(f"Open Ports   : {len(OPEN_PORTS)}")
-    print("=" * 50)
+def main():
+    args = parse_args()
+    port_range = parse_port_range(args.port) 
+    
+    # Simple regex validation for IP or hostname format consistency
+    if not re.match(r"^[a-zA-Z0-9.-]+$", args.host):
+        perror(f"{COLORS['red']}E:{COLORS['reset']} '{args.host}' is not a valid target!")
+    
+    print(f"{COLORS['blue']}+ scanning{COLORS['reset']}: {args.host} ({args.timeout:.2f}s delay | range: {port_range["start"]}-{port_range["end"]})")
+    print("-" * 75)
 
+    with ThreadPoolExecutor(max_workers=args.threads) as t_exec:
+        # FIXED: Created a proper dict comprehension mapping Future object -> Port Integer
+        futures = {
+            t_exec.submit(
+                scan, args.host, port, args.timeout, args.banner_size, args.payload
+            ): port 
+            for port in range(port_range["start"], port_range["end"] + 1)
+        }
 
-def print_results():
-    """
-    Print discovered open ports in a table-like format.
-    """
-    if not OPEN_PORTS:
-        print("\n[!] No open ports found.")
-        return
+        for future in as_completed(futures):
+            port = futures[future]  # FIXED: Safely look up the port from the dictionary
 
-    print("\n[+] Open Ports & Services:\n")
-    print(f"{'PORT':<10} | SERVICE")
-    print("-" * 50)
-
-    for port, banner in sorted(OPEN_PORTS.items()):
-        print(f"{port:<10} | {banner}")
-
-
-# -----------------------------
-# Entry Point
-# -----------------------------
-async def main():
-    """
-    Main execution function:
-    - Parse arguments
-    - Launch async scan tasks
-    - Display results
-    """
-    args = parse_arguments()
-
-    semaphore = asyncio.Semaphore(args.max_concurrency)
-
-    tasks = [
-        scan_with_limit(
-            args.host,
-            port,
-            args.timeout,
-            args.buffer_size,
-            args.payload,
-            semaphore
-        )
-        for port in range(1, args.range + 1)
-    ]
-
-    try:
-        await asyncio.gather(*tasks)
-
-        print_scan_summary(args.host, args.range)
-        print_results()
-
-    except KeyboardInterrupt:
-        print("\n[!] Scan interrupted by user.")
-    except Exception as e:
-        print(f"[!] Error: {e}")
+            try:
+                result = future.result()
+                if result:
+                    print(f"{COLORS['green']}{result['port']}{COLORS['reset']}: {result['banner']}")
+            except Exception as e:
+                print(f"{COLORS['red']}E:{COLORS['reset']} Port {port} raised {e}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
